@@ -118,6 +118,8 @@ export interface Conflict {
 export type Attribution = "bare" | "company_stated" | "forward_looking" | "regulatory";
 
 export interface Sentence {
+  /** Which of the 12 this sentence answers. Set by the compose call, preserved through binding. */
+  question_id: QuestionId;
   text: string;
   /** Non-empty by construction. */
   claim_ids: string[];
@@ -138,7 +140,9 @@ export type RejectionReason =
   | "stale"
   | "unroutable"
   | "no_surviving_citation"
-  | "forward_looking_in_change_section";
+  | "forward_looking_in_change_section"
+  /** More supported sentences than the question's cap. Recorded rather than silently truncated. */
+  | "over_question_cap";
 
 export interface Rejection {
   reason: RejectionReason;
@@ -180,6 +184,13 @@ export interface Cost {
 export interface Brief {
   company: Company;
   sections: BriefSection[];
+  /**
+   * Every claim that survived the gate, with its resolved span. Sentences carry ids; this is where
+   * the ids resolve to. It is what lets the UI turn a citation into a highlighted character range,
+   * and what lets the sweep re-resolve every span independently instead of trusting the one that was
+   * stored.
+   */
+  claims: Claim[];
   conflicts: Conflict[];
   rejected: Rejection[];
   coverage: Coverage;
