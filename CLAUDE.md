@@ -6,10 +6,30 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project state
 
-**Scaffolded.** Next 16 app, the type contract in `lib/brief/types.ts`, the 12 questions and the
-routing table in `lib/brief/questions.ts`, and `purity.test.ts` guarding the boundary. The corpus,
-the gate and the reader land in the commits that follow. The ten-commit task order in `PLAN.md` is
-the build sequence; follow it rather than inventing one.
+**Feature-complete, fixtures pending.** Engine, gate, corpus, routes, both exports, the reader and
+the sweep are all built and tested — 335 tests, `npm run build`/`typecheck`/`lint` clean. What is
+missing is `data/briefs/*.json`.
+
+Generating the ten briefs costs 20 model calls (2 per company) and **the free tier for
+`gemini-3.6-flash` allows 20 requests per day**, already spent when the build reached that step. So
+the repo ships partially generated on purpose: `data/briefs/index.ts` names which companies exist,
+the sweep lists the ones it could not check, and the reader shows an explicit "no cached brief yet"
+state with the command to fix it. Screenshots, the GIF and the deploy wait on the fixtures.
+
+Next action: `npm run generate:briefs` once the quota resets, then the sweep, then docs assets.
+
+Four things landed differently from `PLAN.md`, deliberately, and the reasons are worth keeping:
+
+- **Extraction is one call per company, not one per (document, section).** The plan's shape was 137
+  calls for this corpus, which 20/day makes unrunnable, and it made a five-document paste cost
+  fifteen calls. The model must now name the document each quote came from, so the isolation lost is
+  bought back by the gate: a misattributed quote fails to resolve.
+- **`buildBrief` takes `composed` as an input.** The sentences come from a model, and calling one
+  from inside the pure engine is the coupling the purity rule forbids.
+- **`Brief` carries its surviving claims,** so a citation can resolve to a span and the sweep can
+  re-resolve every span independently instead of trusting the stored one.
+- **The corpus is TypeScript modules, not `corpus.json`.** 68 documents of authored prose in JSON
+  makes the most reviewable artifact in the repo unreadable in a diff. Zod still parses at import.
 
 `PLAN.md` is the source of truth for scope, the data model, the 12 questions, the gate's matching
 rules, attribution templates, conflict and staleness policy, the corpus trap table, sweep
