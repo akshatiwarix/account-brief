@@ -3,7 +3,7 @@ import { GoogleGenAI, ThinkingLevel } from "@google/genai";
 import { chunkDocument } from "@/lib/brief/chunk";
 import { buildBrief } from "@/lib/brief";
 import { detectConflicts } from "@/lib/brief/conflict";
-import { QUESTIONS, SECTIONS, extractableQuestions, routeDocuments } from "@/lib/brief/questions";
+import { QUESTIONS, extractableQuestions, routeDocuments } from "@/lib/brief/questions";
 import { resolveClaims } from "@/lib/brief/resolve";
 import type {
   Brief,
@@ -70,49 +70,53 @@ export async function generateBrief({
     claims_surviving: 0,
   };
 
+  /*
+   * Routing still runs first, and still costs nothing: a question no document can answer is not put
+   * in the request at all. What changed from PLAN.md is the call shape — one request per company
+   * rather than one per (document, section) — because the free tier for this model allows 20 requests
+   * per day, which makes a 78-call generation unrunnable. See `prompts.ts` for what that trade buys
+   * back.
+   */
+  const bodies = documents.map((document) => ({ document, chunks: chunkDocument(document) }));
+  const asked = extractableQuestions()
+    .map((question) => ({
+      question,
+      documentIds: routeDocuments(question, documents).map((document) => document.id),
+    }))
+    .filter((entry) => entry.documentIds.length > 0);
+
   const claims: Claim[] = [];
 
-  for (const document of documents) {
-    const chunks = chunkDocument(document);
+  if (asked.length > 0) {
+    const request = extractRequest(company, bodies, asked);
 
-    for (const section of SECTIONS) {
-      const questions = extractableQuestions().filter(
-        (question) =>
-          question.section === section.id && routeDocuments(question, [document]).length > 0,
-      );
-      // Routing decided this before any call: a section with no question this document can answer is
-      // simply never sent. Gaps are computed, not discovered.
-      if (questions.length === 0) continue;
+    const outcome = await extractOnce(ai, request);
+    cost.extract_calls += 1;
+    if (!outcome.ok) return outcome;
 
-      const request = extractRequest(company, document, chunks, questions);
+    let batch = toClaims(outcome.claims, company, documents);
+    cost.claims_returned += batch.length;
 
-      const outcome = await extractOnce(ai, request);
-      cost.extract_calls += 1;
-      if (!outcome.ok) return outcome;
+    // The gate, run early, purely to decide whether a retry is worth spending.
+    const checked = resolveClaims({ claims: batch, documents, company_id: company.id });
+    const missed = checked.rejected
+      .filter((rejection) => rejection.reason === "quote_not_found")
+      .map((rejection) => rejection.claim)
+      .filter((claim): claim is Claim => claim !== undefined)
+      .map((claim) => ({ document_id: claim.document_id, quote: claim.quote }));
 
-      let batch = toClaims(outcome.claims, company, document);
+    if (missed.length > 0) {
+      const second = await extractOnce(ai, retryRequest(request, missed));
+      cost.retry_calls += 1;
+      if (!second.ok) return second;
+
+      // The retry replaces the batch rather than adding to it. Merging both would double-count the
+      // claims that were already fine and invite duplicate sentences.
+      batch = toClaims(second.claims, company, documents, "r");
       cost.claims_returned += batch.length;
-
-      // The gate, run early, purely to decide whether a retry is worth spending.
-      const checked = resolveClaims({ claims: batch, documents, company_id: company.id });
-      const missed = checked.rejected
-        .filter((rejection) => rejection.reason === "quote_not_found")
-        .map((rejection) => rejection.claim?.quote)
-        .filter((quote): quote is string => quote !== undefined);
-
-      if (missed.length > 0) {
-        const second = await extractOnce(ai, retryRequest(request, missed));
-        cost.retry_calls += 1;
-        if (!second.ok) return second;
-
-        // The retry replaces the batch rather than adding to it. Merging both would double-count the
-        // claims that were already fine and invite duplicate sentences.
-        batch = toClaims(second.claims, company, document, "r");
-        cost.claims_returned += batch.length;
-      }
-
-      claims.push(...batch);
     }
+
+    claims.push(...batch);
   }
 
   const surviving = resolveClaims({ claims, documents, company_id: company.id }).resolved;
@@ -171,6 +175,20 @@ async function composeOnce(ai: GoogleGenAI, request: string): Promise<ComposeOut
   return { ok: true, sentences: parsed.data.sentences };
 }
 
+/**
+ * Backoff for the free tier's per-minute quota only.
+ *
+ * Generating all ten fixtures is ~140 calls, which will hit a per-minute limit on any free key. A
+ * quota refusal is not a failure of the request, so it is retried; a schema error or a bad key is,
+ * and is returned immediately. Waiting on the wrong class of error would turn a typo in an API key
+ * into a two-minute hang.
+ */
+const QUOTA_BACKOFF_MS = [2_000, 10_000, 30_000];
+
+function isQuotaError(message: string): boolean {
+  return /429|RESOURCE_EXHAUSTED|rate limit|quota|503|UNAVAILABLE|overloaded/i.test(message);
+}
+
 async function call(
   ai: GoogleGenAI,
   systemInstruction: string,
@@ -178,31 +196,41 @@ async function call(
   responseSchema: object,
 ): Promise<{ ok: true; json: unknown } | { ok: false; status: number; error: string }> {
   let text: string | undefined;
-  try {
-    const response = await ai.models.generateContent({
-      model: MODEL,
-      contents,
-      config: {
-        systemInstruction,
-        responseMimeType: "application/json",
-        responseSchema,
-        // Not for quality: for reproducibility. The fixtures' `inputs_hash` and the eval scoreboard
-        // are only meaningful if the same inputs produce the same output.
-        temperature: 0,
-        // Constrained extraction against a fixed schema, not reasoning. Day 001 measured this taking
-        // thought tokens to zero, and the free tier's per-minute quota is what limits the demo.
-        thinkingConfig: { thinkingLevel: ThinkingLevel.MINIMAL },
-      },
-    });
-    text = response.text;
-  } catch (cause) {
-    return {
-      ok: false,
-      status: 502,
-      error: `The model call failed: ${cause instanceof Error ? cause.message : "unknown error"}`,
-    };
+  let lastError = "unknown error";
+
+  for (let attempt = 0; attempt <= QUOTA_BACKOFF_MS.length; attempt += 1) {
+    try {
+      const response = await ai.models.generateContent({
+        model: MODEL,
+        contents,
+        config: {
+          systemInstruction,
+          responseMimeType: "application/json",
+          responseSchema,
+          // Not for quality: for reproducibility. The fixtures' `inputs_hash` and the eval scoreboard
+          // are only meaningful if the same inputs produce the same output.
+          temperature: 0,
+          // Constrained extraction against a fixed schema, not reasoning. Day 001 measured this
+          // taking thought tokens to zero, and the free tier's per-minute quota is what limits the
+          // live demo.
+          thinkingConfig: { thinkingLevel: ThinkingLevel.MINIMAL },
+        },
+      });
+      text = response.text;
+      break;
+    } catch (cause) {
+      lastError = cause instanceof Error ? cause.message : "unknown error";
+      const wait = QUOTA_BACKOFF_MS[attempt];
+      if (!isQuotaError(lastError) || wait === undefined) {
+        return { ok: false, status: 502, error: `The model call failed: ${lastError}` };
+      }
+      await new Promise((resolve) => setTimeout(resolve, wait));
+    }
   }
 
+  if (text === undefined) {
+    return { ok: false, status: 502, error: `The model call failed after retries: ${lastError}` };
+  }
   if (!text) return { ok: false, status: 502, error: "The model returned an empty response." };
 
   try {
@@ -245,27 +273,40 @@ export function subjectIdFor(subject: string, company: Company): string {
 function toClaims(
   raw: ReturnType<typeof extractResponseSchema.parse>["claims"],
   company: Company,
-  document: SourceDocument,
+  documents: readonly SourceDocument[],
   suffix = "",
 ): Claim[] {
-  return raw.map((entry, index) => ({
-    id: `${document.id}-${entry.question_id}-${suffix}${String(index).padStart(2, "0")}`,
-    question_id: entry.question_id,
-    assertion: entry.assertion,
-    quote: entry.quote,
-    span: null,
-    document_id: document.id,
-    subject_company_id: subjectIdFor(entry.subject, company),
-    kind: entry.kind,
-    stance: entry.stance,
-    value:
-      entry.kind === "number" &&
-      typeof entry.value_n === "number" &&
-      typeof entry.value_unit === "string" &&
-      entry.value_unit.length > 0
-        ? { n: entry.value_n, unit: entry.value_unit }
-        : null,
-    // The document's date, never today. A claim is as old as the page it came from.
-    observed_at: document.published_at ?? document.retrieved_at,
-  }));
+  const byId = new Map(documents.map((document) => [document.id, document]));
+
+  return raw.map((entry, index) => {
+    const document = byId.get(entry.document_id);
+
+    return {
+      id: `${entry.document_id}-${entry.question_id}-${suffix}${String(index).padStart(2, "0")}`,
+      question_id: entry.question_id,
+      assertion: entry.assertion,
+      quote: entry.quote,
+      span: null,
+      document_id: entry.document_id,
+      subject_company_id: subjectIdFor(entry.subject, company),
+      kind: entry.kind,
+      stance: entry.stance,
+      value:
+        entry.kind === "number" &&
+        typeof entry.value_n === "number" &&
+        typeof entry.value_unit === "string" &&
+        entry.value_unit.length > 0
+          ? { n: entry.value_n, unit: entry.value_unit }
+          : null,
+      /*
+       * The named document's date, never today. A claim is as old as the page it came from.
+       *
+       * An invented document id has no date, and dating it to the as-of would make a fabricated
+       * citation look maximally fresh. It gets the epoch instead, which is past every horizon — so
+       * even in the impossible case where such a claim resolved, staleness would kill it. The
+       * expected path is that `resolveClaims` rejects it as `quote_not_found` first.
+       */
+      observed_at: document ? document.published_at ?? document.retrieved_at : "1970-01-01",
+    };
+  });
 }

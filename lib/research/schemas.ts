@@ -25,13 +25,17 @@ export const EXTRACT_RESPONSE_SCHEMA = {
       type: Type.ARRAY,
       items: {
         type: Type.OBJECT,
-        required: ["question_id", "assertion", "quote", "subject", "kind", "stance"],
+        required: ["question_id", "document_id", "assertion", "quote", "subject", "kind", "stance"],
         properties: {
           question_id: { type: Type.STRING, enum: [...questionIds] },
+          document_id: {
+            type: Type.STRING,
+            description: "The id of the document this quote was copied from.",
+          },
           assertion: { type: Type.STRING },
           quote: {
             type: Type.STRING,
-            description: "Copied character-for-character from the document. One contiguous run.",
+            description: "Copied character-for-character from that document. One contiguous run.",
           },
           subject: {
             type: Type.STRING,
@@ -55,6 +59,7 @@ export const extractResponseSchema = z.object({
     .array(
       z.object({
         question_id: z.enum(questionIds),
+        document_id: z.string().min(1).max(64),
         assertion: z.string().min(1).max(500),
         quote: z.string().min(1).max(1000),
         subject: z.string().min(1).max(200),
@@ -64,8 +69,9 @@ export const extractResponseSchema = z.object({
         value_unit: z.string().max(60).nullable().optional(),
       }),
     )
-    // A single call returning hundreds of claims is a runaway, not a thorough read.
-    .max(60),
+    // One call now covers a whole company, so the cap is per company rather than per document. A
+    // hundred and twenty claims from eleven documents is a runaway, not a thorough read.
+    .max(120),
 });
 
 export type ExtractResponse = z.infer<typeof extractResponseSchema>;

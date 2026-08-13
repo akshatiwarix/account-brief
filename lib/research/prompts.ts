@@ -1,4 +1,4 @@
-import type { QuestionSpec } from "@/lib/brief/questions";
+import { INFERRED_QUESTION, type QuestionSpec } from "@/lib/brief/questions";
 import type { Chunk } from "@/lib/brief/chunk";
 import type { Claim, Company, Conflict, SourceDocument } from "@/lib/brief/types";
 
@@ -16,13 +16,13 @@ import type { Claim, Company, Conflict, SourceDocument } from "@/lib/brief/types
  * here, it is `resolve.ts`'s. The prompt's job is to make the honest path the easy one.
  */
 
-export const PROMPT_VERSION = "2026-08-14.1";
+export const PROMPT_VERSION = "2026-08-14.3";
 
-export const EXTRACT_SYSTEM_PROMPT = `You extract claims from a single source document about a single company.
+export const EXTRACT_SYSTEM_PROMPT = `You extract claims from a set of source documents about a single company.
 
 Rules, in order of importance:
 
-1. QUOTE VERBATIM. Every claim carries a "quote" field that must be copied character-for-character from the document text you were given. Do not fix typos, do not normalise punctuation, do not shorten with an ellipsis, do not join text across a gap. A quote that is not a contiguous substring of the document is discarded by a checker downstream, and the claim is lost.
+1. QUOTE VERBATIM, AND NAME THE DOCUMENT IT CAME FROM. Every claim carries a "document_id" and a "quote". The quote must be copied character-for-character from THAT document's text. Do not fix typos, do not normalise punctuation, do not shorten with an ellipsis, do not join text across a gap, and never attribute a quote to a document it did not come from. A quote that is not a contiguous substring of the document you named is discarded by a checker downstream, and the claim is lost.
 2. Keep quotes short but complete: the shortest contiguous run of the document that actually supports the claim, typically 8 to 30 words.
 3. ONE ASSERTION PER CLAIM. "assertion" is your own one-sentence restatement. It must be supported by the quote alone.
 4. NAME THE SUBJECT. "subject" is the company the claim is about. Documents mention competitors, customers, investors and acquisitions; a sentence about another company is a claim about that company, and you must say so. Never attribute a competitor's numbers to the company being researched.
@@ -47,36 +47,83 @@ Rules:
 8. For the question "likely_owner_and_hook" only, you may reason across the claims to suggest who probably owns the problem and what the opening should be — still citing the claims your reasoning rests on, and still without adding facts.
 9. Respect the per-question sentence limit you are given. Extra sentences are dropped.`;
 
-/** The user-side content for one extraction call: one document, one section's questions. */
+/**
+ * One extraction call per company, carrying all of its documents.
+ *
+ * PLAN.md specified one call per (document, section) — ~78 calls for the corpus, and better isolation:
+ * a model reading one document cannot mix two up. It was abandoned for a hard external limit rather
+ * than a design preference. The free tier for this model allows **20 requests per day**, which makes a
+ * 78-call generation impossible to run at all, and makes a paste of five documents cost fifteen calls
+ * instead of two.
+ *
+ * Batching per company costs isolation and buys something real back: the model must now name the
+ * document each quote came from, and a quote attributed to the wrong document fails to resolve. So the
+ * risk the batching introduces is caught by the same gate that catches everything else, and the
+ * rejected pane shows it happening. `c06` remains the sharper trap, because there the quote and the
+ * document are both right and only the subject is wrong.
+ */
+/** Per-document prompt budget. A pasted document may be 40,000 characters; a prompt of ten is not. */
+export const MAX_CHARS_PER_DOCUMENT = 12_000;
+
 export function extractRequest(
   company: Company,
-  document: SourceDocument,
-  chunks: readonly Chunk[],
-  questions: readonly QuestionSpec[],
+  documents: readonly { document: SourceDocument; chunks: readonly Chunk[] }[],
+  questions: readonly { question: QuestionSpec; documentIds: readonly string[] }[],
 ): string {
   const asked = questions
-    .map((question) => `- ${question.id}: ${question.label} — look for ${question.seek}`)
+    .map(
+      ({ question, documentIds }) =>
+        `- ${question.id}: ${question.label} — look for ${question.seek}\n  answerable only from: ${documentIds.join(", ")}`,
+    )
     .join("\n");
 
-  const body = chunks
-    .map((chunk) => (chunk.heading ? `[section: ${chunk.heading}]\n${chunk.text}` : chunk.text))
-    .join("\n");
+  const bodies = documents
+    .map(({ document, chunks }) => {
+      /*
+       * The body must be a byte-exact prefix of the document.
+       *
+       * The first version of this joined chunks with a newline and prefixed each with a
+       * `[section: …]` label. Both insert text the gate will never see, so a quote spanning a
+       * boundary could contain characters that exist nowhere in the document — a rejection caused
+       * entirely by the prompt. Chunks are contiguous slices, so they concatenate back exactly;
+       * the markdown headings are already in the text and the labels were redundant anyway.
+       *
+       * Chunking's real job here is the truncation boundary: an over-long document is cut at a
+       * section break rather than mid-sentence, and the cut is stated rather than hidden.
+       */
+      let used = 0;
+      const kept: string[] = [];
+      for (const chunk of chunks) {
+        if (used > 0 && used + chunk.text.length > MAX_CHARS_PER_DOCUMENT) break;
+        kept.push(chunk.text);
+        used += chunk.text.length;
+      }
+      const truncated = used < document.text.length;
+      const body = kept.join("") + (truncated ? `\n\n[document truncated after ${used} characters]` : "");
 
-  return `COMPANY BEING RESEARCHED: ${company.name} (${company.domain}), ${company.industry}
-
-DOCUMENT
-id: ${document.id}
+      return `--- DOCUMENT ${document.id} ---
 kind: ${document.kind}
 title: ${document.title}
 url: ${document.url}
 published: ${document.published_at ?? "undated"}
 
-QUESTIONS TO ANSWER FROM THIS DOCUMENT
+${body}
+--- END OF DOCUMENT ${document.id} ---`;
+    })
+    .join("\n\n");
+
+  return `COMPANY BEING RESEARCHED: ${company.name} (${company.domain}), ${company.industry}
+
+QUESTIONS TO ANSWER
 ${asked}
 
-DOCUMENT TEXT BEGINS
-${body}
-DOCUMENT TEXT ENDS`;
+Only use the documents listed for a question. A claim answering a question from a document not listed for it will be discarded.
+
+DOCUMENTS BEGIN
+
+${bodies}
+
+DOCUMENTS END`;
 }
 
 /**
@@ -86,14 +133,19 @@ DOCUMENT TEXT ENDS`;
  * were not found is what makes the second attempt different, and bounding it at one keeps a bad
  * document from turning into an unbounded spend.
  */
-export function retryRequest(original: string, failedQuotes: readonly string[]): string {
-  const list = failedQuotes.map((quote) => `- ${JSON.stringify(quote)}`).join("\n");
+export function retryRequest(
+  original: string,
+  failed: readonly { document_id: string; quote: string }[],
+): string {
+  const list = failed
+    .map((entry) => `- in ${entry.document_id}: ${JSON.stringify(entry.quote)}`)
+    .join("\n");
   return `${original}
 
-RETRY. These quotes from your previous answer were NOT found in the document text above:
+RETRY. These quotes from your previous answer were NOT found in the document you attributed them to:
 ${list}
 
-They were paraphrased, re-punctuated, or stitched together across a gap. Extract again. Copy each quote character-for-character from the document text, as one contiguous run. If a claim cannot be supported by such a quote, omit the claim entirely — an omitted claim costs nothing and a wrong quote is discarded anyway.`;
+They were paraphrased, re-punctuated, stitched together across a gap, or taken from a different document than the one you named. Extract again. Copy each quote character-for-character from the document you attribute it to, as one contiguous run. If a claim cannot be supported by such a quote, omit the claim entirely — an omitted claim costs nothing and a wrong quote is discarded anyway.`;
 }
 
 export function composeRequest(
@@ -108,6 +160,17 @@ export function composeRequest(
   const grouped = questions
     .map((question) => {
       const mine = claims.filter((claim) => claim.question_id === question.id);
+
+      /*
+       * The inferred question has no claims of its own — that is what makes it inferred. Listing only
+       * questions that have claims silently dropped it from the request, and the first generated
+       * fixture came back with an empty Approach section for every company. It is asked for
+       * explicitly, and it still has to cite the claims its reasoning rests on.
+       */
+      if (mine.length === 0 && question.id === INFERRED_QUESTION) {
+        return `${question.id} — ${question.label} (at most ${question.max_sentences} sentences)\n  No claims of its own. Reason over the claims listed above, and cite the ones you used.`;
+      }
+
       if (mine.length === 0) return null;
       const lines = mine
         .map(

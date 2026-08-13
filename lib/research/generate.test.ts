@@ -37,33 +37,82 @@ describe("subjectIdFor", () => {
 });
 
 describe("extraction requests", () => {
-  const document = documentsFor("c01")[0]!;
-  const request = extractRequest(
-    companyById("c01")!,
-    document,
-    chunkDocument(document),
-    extractableQuestions().slice(0, 2),
-  );
+  const c01 = companyById("c01")!;
+  const c01Documents = documentsFor("c01");
+  const bodies = c01Documents.map((document) => ({ document, chunks: chunkDocument(document) }));
+  const asked = extractableQuestions()
+    .map((question) => ({
+      question,
+      documentIds: routeDocuments(question, c01Documents).map((document) => document.id),
+    }))
+    .filter((entry) => entry.documentIds.length > 0);
+  const request = extractRequest(c01, bodies, asked);
 
   it("names the company being researched, so the subject rule is answerable", () => {
     expect(request).toContain("COMPANY BEING RESEARCHED: Ledgerloop");
   });
 
-  it("carries the document's own text verbatim", () => {
-    // Anything less means the quote the model returns cannot be checked against what it saw.
-    for (const chunk of chunkDocument(document)) {
-      expect(request).toContain(chunk.text.trim().slice(0, 60));
+  it("carries every document's text byte-exactly, inserting nothing", () => {
+    // The gate checks quotes against the document, so anything the prompt inserts into the body is a
+    // rejection the prompt caused. An earlier version joined chunks with a newline and labelled each
+    // with its heading; both broke this.
+    for (const document of c01Documents) {
+      expect(request, document.id).toContain(document.text);
     }
   });
 
-  it("asks only the questions it was given", () => {
-    expect(request).toContain("what_they_sell");
-    expect(request).not.toContain("third_party_complaints");
+  it("truncates an over-long document on a section boundary and says so", () => {
+    const long = {
+      ...c01Documents[0]!,
+      text: `${"# H\n\nbody paragraph.\n\n".repeat(1200)}`,
+    };
+    const output = extractRequest(
+      c01,
+      [{ document: long, chunks: chunkDocument(long) }],
+      asked.slice(0, 1),
+    );
+    expect(output).toContain("[document truncated after");
+    expect(output.length).toBeLessThan(long.text.length);
   });
 
-  it("echoes failed quotes back on retry", () => {
-    const retry = retryRequest(request, ["a quote that was not found"]);
+  it("labels each document with its id, so a quote can be attributed", () => {
+    for (const document of c01Documents) {
+      expect(request).toContain(`--- DOCUMENT ${document.id} ---`);
+    }
+  });
+
+  it("tells each question which documents may answer it", () => {
+    // Routing survives the batching: the model is told the allowed documents per question, and a
+    // claim from an unlisted document is discarded downstream.
+    expect(request).toContain("answerable only from:");
+    const pricing = asked.find((entry) => entry.question.id === "pricing_shape")!;
+    expect(pricing.documentIds).toContain("c01-d02");
+    expect(pricing.documentIds).not.toContain("c01-d01");
+  });
+
+  it("omits questions no document can answer", () => {
+    const thin = documentsFor("c09");
+    const thinAsked = extractableQuestions()
+      .map((question) => ({
+        question,
+        documentIds: routeDocuments(question, thin).map((document) => document.id),
+      }))
+      .filter((entry) => entry.documentIds.length > 0);
+    const thinRequest = extractRequest(
+      companyById("c09")!,
+      thin.map((document) => ({ document, chunks: chunkDocument(document) })),
+      thinAsked,
+    );
+    expect(thinRequest).not.toContain("third_party_complaints");
+    expect(thinRequest).not.toContain("pricing_shape");
+  });
+
+  it("echoes failed quotes back on retry, with the document each was attributed to", () => {
+    const retry = retryRequest(request, [
+      { document_id: "c01-d02", quote: "a quote that was not found" },
+    ]);
     expect(retry).toContain("were NOT found");
+    expect(retry).toContain("in c01-d02");
     expect(retry).toContain("a quote that was not found");
     expect(retry).toContain(request);
   });
@@ -107,6 +156,7 @@ describe("response schemas", () => {
       claims: [
         {
           question_id: "scale",
+          document_id: "c02-d04",
           assertion: "They employ 340 people.",
           quote: "The company now employs 340 employees",
           subject: "Cadence Freight",
@@ -125,6 +175,7 @@ describe("response schemas", () => {
       claims: [
         {
           question_id: "what_they_smell",
+          document_id: "c01-d01",
           assertion: "a",
           quote: "b",
           subject: "c",
@@ -138,7 +189,26 @@ describe("response schemas", () => {
 
   it("rejects an empty quote before it can match at offset zero", () => {
     const parsed = extractResponseSchema.safeParse({
-      claims: [{ question_id: "scale", assertion: "a", quote: "", subject: "c", kind: "fact", stance: "company" }],
+      claims: [
+        {
+          question_id: "scale",
+          document_id: "c01-d01",
+          assertion: "a",
+          quote: "",
+          subject: "c",
+          kind: "fact",
+          stance: "company",
+        },
+      ],
+    });
+    expect(parsed.success).toBe(false);
+  });
+
+  it("requires a document id, because a quote with no source cannot be checked", () => {
+    const parsed = extractResponseSchema.safeParse({
+      claims: [
+        { question_id: "scale", assertion: "a", quote: "b", subject: "c", kind: "fact", stance: "company" },
+      ],
     });
     expect(parsed.success).toBe(false);
   });
@@ -226,20 +296,24 @@ describe("inputs_hash", () => {
 });
 
 describe("the call budget, counted before spending it", () => {
-  it("is the number of (document, applicable section) pairs plus one", () => {
-    // The number that goes in the README. Computed from the routing table, not guessed.
-    let extract = 0;
+  it("is two calls per company, which is what the free tier's 20-per-day allows", () => {
+    // The number that goes in the README, computed rather than guessed. PLAN.md's original shape was
+    // one call per (document, section) — 137 calls for this corpus — which the daily quota makes
+    // unrunnable. See prompts.ts for what batching costs and what it buys back.
+    let perDocumentPerSection = 0;
     for (const document of DOCUMENTS) {
       for (const section of SECTIONS) {
         const applicable = extractableQuestions().filter(
           (question) =>
             question.section === section.id && routeDocuments(question, [document]).length > 0,
         );
-        if (applicable.length > 0) extract += 1;
+        if (applicable.length > 0) perDocumentPerSection += 1;
       }
     }
-    // 68 documents across ten companies; every company also makes one compose call.
-    expect(extract).toBeGreaterThan(100);
-    expect(extract).toBeLessThan(200);
+    expect(perDocumentPerSection).toBeGreaterThan(100);
+
+    const batched = COMPANIES.length * 2;
+    expect(batched).toBe(20);
+    expect(batched).toBeLessThan(perDocumentPerSection);
   });
 });
