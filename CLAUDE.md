@@ -2,10 +2,14 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+@AGENTS.md
+
 ## Project state
 
-**Planned, not yet built.** Only `PLAN.md`, `LICENSE` and `.gitignore` exist. The ten-commit task
-order in `PLAN.md` is the build sequence; follow it rather than inventing one.
+**Scaffolded.** Next 16 app, the type contract in `lib/brief/types.ts`, the 12 questions and the
+routing table in `lib/brief/questions.ts`, and `purity.test.ts` guarding the boundary. The corpus,
+the gate and the reader land in the commits that follow. The ten-commit task order in `PLAN.md` is
+the build sequence; follow it rather than inventing one.
 
 `PLAN.md` is the source of truth for scope, the data model, the 12 questions, the gate's matching
 rules, attribution templates, conflict and staleness policy, the corpus trap table, sweep

@@ -1,0 +1,64 @@
+@import "tailwindcss";
+
+/*
+ * `dark:` responds to the OS setting *and* to a `.dark` class on <html>, so dark mode can be
+ * exercised deliberately from a console instead of only by changing system preferences.
+ */
+@custom-variant dark {
+  @media (prefers-color-scheme: dark) {
+    @slot;
+  }
+  &:where(.dark, .dark *) {
+    @slot;
+  }
+}
+
+@theme inline {
+  --font-sans: var(--font-geist-sans);
+  --font-mono: var(--font-geist-mono);
+}
+
+body {
+  font-family: var(--font-sans), ui-sans-serif, system-ui, sans-serif;
+}
+
+/*
+ * The highlighted span in a source document. It is applied to a <mark> the server renders around
+ * real character offsets, so the flash is the only thing that needs to be a class: the position is
+ * already correct before any JavaScript runs.
+ */
+mark.span {
+  background: color-mix(in oklch, oklch(0.85 0.16 95) 60%, transparent);
+  border-radius: 0.125rem;
+  padding: 0.05rem 0;
+  scroll-margin-block: 40vh;
+}
+
+@media (prefers-color-scheme: dark) {
+  mark.span {
+    background: color-mix(in oklch, oklch(0.72 0.15 95) 35%, transparent);
+    color: inherit;
+  }
+}
+
+/* Target flash when a citation link jumps to a span, so the eye lands in the right place. */
+mark.span:target {
+  animation: span-flash 1.2s ease-out 1;
+}
+
+@keyframes span-flash {
+  0%,
+  40% {
+    box-shadow: 0 0 0 3px color-mix(in oklch, oklch(0.7 0.2 25) 70%, transparent);
+  }
+  100% {
+    box-shadow: 0 0 0 3px transparent;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  mark.span:target {
+    animation: none;
+    outline: 2px solid color-mix(in oklch, oklch(0.7 0.2 25) 70%, transparent);
+  }
+}
